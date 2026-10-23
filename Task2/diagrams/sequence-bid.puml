@@ -1,0 +1,61 @@
+@startuml sequence-bid
+title AdScale — запрос ставки и атомарный резерв
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 300
+
+actor "DSP" as DSP
+participant "DSP gateway\nEnvoy" as GW
+participant "Bidding\nодин процесс" as B
+database "Локальная\nread-модель" as M
+database "Redis Bidding\nодин serving-шард" as R
+
+DSP -> GW: POST /openrtb2/auction\nOpenRTB JSON, tmax=80
+note over DSP,GW
+  Рабочий локальный deadline ≤65 мс от первого байта.
+  Внешние 80 мс подтверждаются тестом с площадкой.
+end note
+GW -> GW: mTLS identity, token bucket,\nразмер, in-flight и ready upstream
+alt Не пройдены auth / лимит / admission
+    GW --> DSP: Auth: TLS отказ / 401 / 403;\nлимит/admission: 429 или договорной technical no-bid
+else Запрос допущен
+    GW -> B: OpenRTB + доверенный deadline\nодин HTTP-вызов, retries=0
+    B -> B: Проверить профиль, fingerprint и tmax
+    B -> M: Зафиксировать версию, проверить freshness / eligibility
+    M --> B: Подтверждённые данные либо запрет участия
+    alt Данные небезопасны / deadline исчерпан
+        B --> GW: 204 + внутренняя technical reason
+    else Данные допустимы
+        B -> B: Подбор и аукцион; подготовить ответ\nи верхнюю стоимость обязательства
+        B -> R: FinalizeDecision(requestKey, fingerprint,\ngrant, generation, maxCharge, proposedResponse)
+        note right of R
+          Одна атомарная операция:
+          дедупликация + проверка квоты
+          + резерв + сохранение ответа.
+          Все ключи в одном hash slot.
+        end note
+        alt Новый обеспеченный bid
+            R --> B: HELD + сохранённый BidResponse
+            B --> GW: 200 + OpenRTB BidResponse
+        else Повтор того же запроса
+            R --> B: Старое решение без нового резерва
+            B --> GW: Прежний ответ, если ещё допустим;\nиначе 204 без нового резерва
+        else Нет кандидата / средств
+            R --> B: NO_BID, денежного резерва нет
+            B --> GW: 204, business-no-bid
+        else Timeout / неизвестный результат Redis
+            B -> B: Не повторять Reserve с новым ID;\nсохранить неопределённость для сверки
+            B --> GW: 204, technical-no-bid
+        end
+    end
+    GW -> GW: Снять latency/result, удалить внутренние заголовки
+    GW --> DSP: Ответ до общего deadline
+end
+
+note over B,R
+  При потере ответа резерв не освобождается по HTTP timeout.
+  Campaign, Finance, Kafka и Delivery отсутствуют в синхронной цепочке.
+end note
+@enduml

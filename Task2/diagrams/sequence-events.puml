@@ -1,0 +1,70 @@
+@startuml sequence-events
+title AdScale — billable-событие, доставка и идемпотентный расчёт
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 300
+
+actor "DSP / подтверждённый\nисточник события" as DSP
+participant "Event Ingestion" as E
+queue "Kafka\nnotices / settlements" as K
+participant "Finance consumer\nи outbox publisher" as F
+database "Finance PostgreSQL\ninbox + ledger + outbox" as DB
+participant "Bidding\nquota projection" as B
+participant "Analytics\nотдельная group" as A
+
+DSP -> E: Billable callback\nустойчивый business key, reservation reference
+E -> E: Проверить источник, контракт,\nсумму/валюту и нормализовать
+E -> K: Publish AuctionBillable\nacks=all, min ISR=2, RF=3
+alt Брокер подтвердил устойчивую запись
+    K --> E: Durable ACK
+    E --> DSP: 204 (для callback без тела)
+else Нет устойчивого ACK
+    E --> DSP: Временная ошибка; повтор с тем же business key
+end
+
+group Для записи, попавшей в устойчивый журнал
+    F -> K: Poll notices
+    K --> F: AuctionBillable (возможно повтор)
+    F -> F: Проверить reservation proof\nбез обращения к Redis Bidding
+    F -> DB: BEGIN; проверить grant / состояние резерва,\nINSERT inbox по business key
+    alt Новый допустимый факт
+        F -> DB: Ledger debit + состояние резерва\n+ outbox SettlementApplied; COMMIT
+        DB --> F: Commit успешен
+    else Тот же ключ и то же содержимое
+        DB --> F: Уже обработан — no-op\nновой проводки нет
+    else Тот же ключ с другой суммой / недопустимый факт
+        F -> DB: Устойчивый карантин / incident state\nбез автоматического debit
+        F -> F: Alert; остановить зависимую последовательность\nдо сверки при необходимости
+    end
+    F -> K: Commit только безопасного непрерывного offset
+    note over F,DB
+      Падение после COMMIT до offset => replay,
+      inbox не допускает второго финансового эффекта.
+    end note
+
+    opt Для подтверждённого нового расчёта
+        F -> DB: Прочитать outbox
+        DB --> F: SettlementApplied(settlementId, version)
+        F -> K: Publish settlement; ожидать ACK
+        K --> F: Durable ACK
+        F -> DB: Пометка outbox
+        B -> K: Poll settlements
+        K --> B: Подтверждённое изменение резерва
+        B -> B: Идемпотентно применить settlementId/version\nбез двойного освобождения квоты
+    end
+
+    A -> K: Poll своей group
+    K --> A: Исходное событие / подтверждённый расчёт
+    A -> A: Дедупликация и обновление ClickHouse
+end
+
+note over DSP,A
+  Win не равен billable. Порядок win/billable/loss не предполагается.
+  ACK потерян после публикации => callback повторится; идемпотентность обязательна.
+  Kafka at-least-once; единственный финансовый эффект обеспечивается ledger/inbox.
+  Клики и показы идут через тот же Ingestion в отдельные topics → Analytics / архив.
+  В CPM-пилоте они сами по себе не создают дополнительную проводку Finance.
+end note
+@enduml

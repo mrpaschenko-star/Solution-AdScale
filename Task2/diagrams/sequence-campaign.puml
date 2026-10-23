@@ -1,0 +1,58 @@
+@startuml sequence-campaign
+title AdScale — изменение кампании и прогрев Bidding
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 300
+
+actor "Рекламодатель / BFF" as UI
+participant "Campaign\n(сервис или модуль монолита)" as C
+database "Campaign PostgreSQL\n+ outbox" as DB
+queue "Kafka\ncampaign.changes" as K
+database "Object storage\nсогласованный snapshot" as S
+participant "Bidding\nProjection manager" as B
+
+UI -> C: PATCH /api/v1/campaigns/{id}\nREST, If-Match: version
+C -> DB: BEGIN; изменить кампанию;\nINSERT outbox(version, eventId); COMMIT
+DB --> C: Зафиксировано
+C --> UI: Новая версия кампании
+C -> DB: Publisher читает неопубликованный outbox
+DB --> C: CampaignChanged
+C -> K: Publish по campaign_id; acks=all
+K --> C: Durable ACK
+C -> DB: Пометить outbox опубликованным
+note over DB,K
+  Падение после Kafka ACK до пометки даёт повтор с тем же eventId.
+end note
+
+group Холодный запуск / восстановление экземпляра Bidding
+    B -> B: readiness=false
+    B -> C: gRPC GetManifest(schemaVersion, region)
+    C --> B: snapshotId, URI, SHA-256,\nсогласованные offsets по разделам
+    B -> S: Загрузить immutable snapshot
+    S --> B: Данные
+    B -> B: Проверить hash/schema; построить индекс
+    B -> K: Replay со snapshot checkpoint\nсобственная group для полного индекса
+    K --> B: Изменения после снимка, включая CampaignChanged
+    B -> B: Применить версии без пропусков;\nдойти до подтверждённого watermark
+    B -> B: Атомарно опубликовать модель;\nreadiness=true при готовности остальных зависимостей
+end
+
+loop Обычная актуализация
+    B -> K: Poll изменений и упорядоченных heartbeat
+    K --> B: Версии и watermark
+    B -> B: Игнорировать дубли; заменить read-модель
+end
+
+alt Нет подтверждения актуальности более 10 с
+    B -> B: Закрыть затронутые кампании / шард\nдля новых ставок; восстановить snapshot + replay
+else Поток подтверждён
+    B -> B: Продолжать serving по текущей версии
+end
+
+note over C,B
+  gRPC и загрузка снимков выполняются фоном.
+  «Snapshot таблиц, затем Kafka latest» не допускается: возможна потеря изменений.
+end note
+@enduml

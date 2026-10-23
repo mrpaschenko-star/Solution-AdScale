@@ -1,0 +1,60 @@
+@startuml sequence-failure
+title AdScale — timeout резерва и безопасное восстановление
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 300
+
+actor "DSP" as DSP
+participant "Envoy" as GW
+participant "Bidding\nquota client + breaker" as B
+database "Redis Bidding" as R
+participant "Recovery coordinator\n/ дежурный" as RC
+participant "Finance" as F
+
+DSP -> GW: Bid request A
+GW -> B: Один upstream request, retries=0
+B -> R: FinalizeDecision(A)
+R -> R: Резерв мог быть записан
+R -x B: Ответ потерян / timeout
+B -> B: Неизвестный результат; no retry\nне освобождать возможный резерв
+B --> GW: Technical no-bid
+GW --> DSP: 204 в пределах deadline\n(по договорённому mapping)
+
+opt Достигнут порог ошибок breaker
+    B -> B: CLOSED → OPEN; пауза с jitter
+    DSP -> GW: Новый bid request B
+    GW -> B: Запрос
+    B --> GW: Быстрый no-bid без вызова Redis
+    GW --> DSP: 204, учитывается как техническая деградация
+end
+
+alt Проверен прежний primary и целая разрешённая generation
+    ... Истёк open-интервал ...
+    B -> R: Ограниченный read-only probe\nHALF_OPEN; не новый резерв
+    R --> B: Состояние и generation подтверждены
+    B -> B: После 3 успешных последовательных проб\nCLOSED; соблюдение исходного лимита
+else Failover / состояние квоты сомнительно
+    B -> B: FROZEN для затронутых grants;\nне возобновлять ставки после одного PING
+    B -> RC: Событие восстановления / alert
+    RC -> RC: Fence старого primary и serving-владельцев;\nдождаться истечения старых разрешений
+    RC -> F: Сверка grants; запрос новой generation\nс идемпотентным allocationRequestId
+    F -> F: Старые сомнительные суммы остаются заблокированы
+    alt Есть независимые свободные средства и доказан fencing
+        F --> RC: Новый обеспеченный grant
+        RC -> R: Инициализация только новой разрешённой generation
+        RC -> B: Новое разрешение и подтверждённое состояние
+        B -> B: Ограниченные probes; затем serving
+    else Нет безопасной квоты / fencing не подтверждён
+        F --> RC: Не выдавать новый лимит
+        RC -> B: Оставить затронутый шард закрытым
+    end
+end
+
+note over B,F
+  Доступность Redis не доказывает сохранность последнего остатка.
+  Снимок или TTL не разрешают повторно потратить сомнительную квоту.
+  Внешний no-bid не скрывается в метриках доступности как обычный бизнес-отказ.
+end note
+@enduml
