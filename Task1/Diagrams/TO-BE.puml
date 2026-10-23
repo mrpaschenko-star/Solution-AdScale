@@ -1,7 +1,12 @@
 @startuml AdScale-TO-BE
-!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/v2.12.0/C4_Container.puml
+!pragma layout smetana
+!define RELATIVE_INCLUDE
+!include ./vendor/C4-PlantUML/C4_Container.puml
 
 LAYOUT_TOP_DOWN()
+skinparam legendFontColor #333333
+skinparam legendBackgroundColor #FFFFFF
+skinparam legendBorderColor #888888
 title AdScale — C4 Container — целевое состояние через год
 
 Person(advertiser, "Рекламодатель", "Кампании, бюджеты, отчёты")
@@ -101,8 +106,8 @@ note bottom of financeDb
 end note
 
 legend bottom
-  C4 Container: приложение или хранилище (не отдельный сервер).
-  Стрелки API показывают инициатора; ответы возвращаются по тому же каналу.
+  C4 Container: приложение или хранилище, а не отдельный сервер.
+  Стрелки API показывают инициатора; ответы возвращаются по тому же соединению.
   Async означает обработку вне критического пути RTB.
   Годовая цель: 50 000 RPS суммарно; SLA 99,9% с согласованной областью измерения.
   50 000 RPS при потере региона требуют соответствующего резерва в другом.
