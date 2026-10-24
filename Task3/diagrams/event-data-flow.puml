@@ -1,0 +1,64 @@
+@startuml event-data-flow
+!pragma layout smetana
+top to bottom direction
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam nodesep 40
+skinparam ranksep 50
+title AdScale — данные в Kafka и независимые проекции
+
+actor "DSP / SDK" as Source
+component "Statistics\nEvent Ingestion" as Ingest
+component "Campaign\nDB + outbox" as Campaign
+component "Finance\ninbox + ledger + outbox" as Finance
+
+package "Региональная Kafka — RF=3, minISR=2, acks=all" {
+    queue "ad.impressions.v1 / ad.clicks.v1\nkey: auction_id\nretention: 24 ч" as Raw
+    queue "auction.notices.v1\nkey: reservation_id\nretention: 7 дней" as Notices
+    queue "campaign.changes.v1\nkey: campaign_id\nretention: 7 дней" as Changes
+    queue "budget.grants.v1 / finance.settlements.v1\nkey: grant_id\nretention: 7 дней" as Money
+}
+
+component "Statistics archive workers\nсвои consumer groups" as Archiver
+storage "Object archive\nobjects + checksum + manifests\ncheckpoint после записи" as Archive
+component "Analytics consumers\nсвои consumer groups" as Analytics
+database "ClickHouse\ncanonical facts → dedup → aggregates" as CH
+component "Bidding campaign projection\ngroup на каждую полную replica" as Projection
+component "Quota manager\nshared groups; idempotent versions" as Quota
+database "Bidding Redis\nрегион / shard / generation" as Redis
+
+Source --> Ingest : HTTPS; стабильные IDs
+Ingest --> Raw : показы / клики
+Ingest --> Notices : win / loss / billable
+Notices --> Finance : проверить proof\nSQL commit до offset
+Campaign --> Changes : transactional outbox
+Finance --> Money : transactional outbox
+Changes --> Projection : version + watermark
+Money --> Quota : grants / settlements
+Quota --> Redis : атомарное применение
+Raw --> Analytics
+Notices --> Analytics
+Changes --> Analytics
+Money --> Analytics
+Analytics --> CH : insert quorum → offset\nFINAL / полные версии buckets
+Raw --> Archiver
+Notices --> Archiver
+Changes --> Archiver
+Money --> Archiver
+Archiver --> Archive : durable object + manifest\nзатем offset
+Archive ..> Analytics : replay / backfill
+
+note bottom of Ingest
+  ACK источнику только после устойчивого Kafka ACK.
+  Повтор возможен; транспортная idempotence
+  не заменяет бизнес-дедупликацию.
+end note
+
+legend bottom
+  Общего порядка между topics нет. Billable может прийти до win.
+  В CPM-пилоте только проверенный billable приводит к debit.
+  Обычный SUM сырых повторных вставок в ClickHouse некорректен.
+  Quarantine: durable incident + alert; зависимая последовательность может остановиться.
+  Kafka retention конечен; архивные lag / coverage контролируются отдельно.
+endlegend
+@enduml

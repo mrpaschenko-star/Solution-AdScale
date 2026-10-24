@@ -1,0 +1,72 @@
+@startuml data-replication
+!pragma layout smetana
+top to bottom direction
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam nodesep 45
+skinparam ranksep 75
+title AdScale — репликация и шардирование данных (deployment overview)
+
+rectangle "Регион A — активный writer Campaign / Finance" as A {
+    database "Campaign PostgreSQL\nprimary + 2 standby / 3 AZ" as CP
+    database "Finance PostgreSQL\nprimary + 2 standby / 3 AZ" as FP
+    node "RTB serving A" as SA
+    database "Redis runtime A\nN primary shards + AZ replicas\nslot по hash tag {sN}" as RA
+    queue "Kafka A\nRF=3 / minISR=2 / 3 AZ" as KA
+    database "ClickHouse A\n2 shards × 2 replicas\n3 Keeper / 3 AZ" as CHA
+    storage "Объектный архив A\nSnapshots + events + backups\nраздельные buckets / ACL" as OA
+}
+
+rectangle "Регион B — RTB active / OLTP DR" as B {
+    database "Campaign / Finance DR\nраздельные async standby\nнет второго writer" as DR
+    node "RTB serving B" as SB
+    database "Redis runtime B\nсобственные shards и grants\nне копия доступных денег A" as RB
+    queue "Kafka B\nRF=3 / minISR=2 / 3 AZ" as KB
+    database "ClickHouse DR\nrestore + replay\nRTO зависит от объёма" as CHB
+    storage "Объектные копии B\nimmutable / versioned" as OB
+}
+
+SA --> RA : локальный атомарный резерв
+SB --> RB : локальный атомарный резерв
+CP ..> DR : async WAL
+FP ..> DR : async WAL
+CP --> KA : outbox changes
+FP --> KA : outbox grants / settlements
+KA --> CHA : Analytics consumers
+KA --> OA : archive workers
+KA <..> KB : async mirror namespaces\nA: control/events; B: notices/events\norigin IDs; без циклов
+OA ..> OB : async object replication
+OB --> CHB : restore / replay
+KA ..> SA : campaign projection / quotas
+KB ..> SB : campaign projection / quotas
+
+note left of CP
+  Для каждого OLTP-кластера:
+  synchronous_commit=on
+  ANY 1 из двух standby
+  HA-кворум + fencing
+  RPO 0 при одном отказе AZ
+end note
+
+note right of RA
+  H(partner_id, request_id) → serving shard
+  Решение + grant + резерв в одном slot
+  Replica lag не даёт права читать бюджет
+  Failover → freeze старой generation
+end note
+
+note bottom of CHA
+  H(advertiser_id, event_id) → shard
+  event_date → месячная partition
+  Стабильный маршрут при replay
+  insert_quorum=2; FINAL для dedup
+end note
+
+legend bottom
+  Каждый regional Kafka требует трёх AZ; схема предполагает их наличие.
+  Async DR не гарантирует нулевой RPO: целевой lag ≤60 с, фактический измеряется.
+  Новые аукционы переключаются после fencing; повторы сохраняют home region.
+  50k RPS после потери региона требуют полной мощности и независимых квот в surviving region.
+  Реплики и mirrors не заменяют PITR, backups и сверку финансов.
+endlegend
+@enduml

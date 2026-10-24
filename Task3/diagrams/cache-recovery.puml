@@ -1,0 +1,62 @@
+@startuml cache-recovery
+title AdScale — прогрев проекции и безопасное восстановление Redis
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 260
+
+participant "Bidding" as B
+participant "Campaign / objects" as C
+queue "Kafka" as K
+database "Redis runtime" as R
+participant "Recovery controller" as RC
+participant "Finance / ledger" as F
+
+group Прогрев нового процесса
+    B -> B: readiness=false
+    B -> C: Получить manifest + snapshot
+    C --> B: schema, SHA-256, региональные offsets
+    B -> B: Проверить; построить immutable индекс
+    B -> K: Replay от согласованных offsets\nсобственная group полной replica
+    K --> B: Изменения + ordered watermark
+    B -> B: Проверить gaps, freshness ≤10 с
+    B -> R: Проверить текущую generation / grants
+    R --> B: Разрешённое состояние
+    B -> B: readiness=true при выполнении всех условий
+end
+
+group Неопределённый резерв / потеря primary
+    B -> R: FinalizeDecision(request key, grant, generation)
+    R --x B: Timeout: исход операции неизвестен
+    B -> B: Технический no-bid\nбез нового reserve ID
+    RC -> RC: Обнаружить потерю / смену primary identity
+    RC -> B: Закрыть затронутый shard / generation
+    RC -> F: Заморозить сомнительные grants
+    F -> F: Сохранить всю неразрешённую сумму\nкак потенциальное обязательство
+    RC -> R: Fence старого primary / владельцев
+    RC -> RC: Подтвердить fencing и истечение permits\nучесть clock skew
+    alt Fencing подтверждён; есть независимые средства
+        RC -> R: Новая generation, без восстановления\nстарого available как разрешения
+        RC -> F: Выдать новый обеспеченный grant\nс idempotency key
+        F -> F: Заблокировать новые средства\nledger + outbox
+        F --> RC: Подтверждённый grant
+        RC -> R: Идемпотентно установить новый grant
+        RC -> B: Открыть shard при свежей проекции
+    else Нельзя доказать безопасность / нет средств
+        RC -> B: Оставить shard закрытым; no-bid
+    end
+end
+
+group Отдельная финансовая сверка
+    K -> F: Notices + reservation proof\nвозможны повторы и поздние события
+    F -> F: Inbox + ledger + outbox одной транзакцией
+    F -> F: Финализировать старые обязательства\nтолько по контракту и результатам сверки
+end
+
+note over B,F
+  TTL, потеря HTTP-ответа и восстановление RDB не доказывают отсутствие расхода.
+  Redis failover не разрешает автоматически продолжить старую generation.
+  RTO serving ≤5 мин — цель при fencing, свежей модели и независимых средствах.
+end note
+@enduml

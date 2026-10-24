@@ -1,0 +1,52 @@
+@startuml data-ownership
+!pragma layout smetana
+!define RELATIVE_INCLUDE
+!include ../../Diagrams/vendor/C4-PlantUML/C4_Container.puml
+LAYOUT_TOP_DOWN()
+skinparam legendFontColor #333333
+skinparam legendBackgroundColor #FFFFFF
+skinparam legendBorderColor #888888
+title AdScale — владение данными через год — C4 Container
+
+System_Ext(dsp, "DSP / источники событий", "OpenRTB и отдельные callbacks")
+System_Boundary(adscale, "AdScale") {
+    Container(bidding, "Bidding", "C++ + in-memory index", "RTB; локальная проекция кампаний")
+    Container(campaign, "Campaign", "REST / gRPC + outbox", "Владелец кампаний и правил")
+    Container(finance, "Finance", "gRPC + consumer + outbox", "Владелец денег и обеспеченных grants")
+    Container(stats, "Statistics", "Ingestion + archive workers", "Приём, нормализация, архивирование")
+    Container(analytics, "Analytics", "Consumers + Query API", "Собственные факты и отчёты")
+
+    ContainerDb(redis, "Bidding runtime", "Redis Cluster", "Резервы, grants, dedup; noeviction")
+    ContainerDb(cpg, "Campaign DB", "PostgreSQL HA", "Кампании, версии, outbox")
+    ContainerDb(fpg, "Finance DB", "PostgreSQL HA", "Ledger, grants, inbox, outbox")
+    ContainerDb(objects, "Campaign objects", "Object storage", "Креативы и consistent snapshots")
+    ContainerQueue(kafka, "Региональные журналы", "Kafka RF=3", "Topics принадлежат producers; ACL по доменам")
+    ContainerDb(archive, "Statistics archive", "Object storage", "Immutable events, manifests, offsets")
+    ContainerDb(ch, "Analytics DB", "ClickHouse", "Канонические факты и версии агрегатов")
+}
+
+Rel(dsp, bidding, "Bid / response через RTB gateway", "HTTPS / OpenRTB")
+Rel(dsp, stats, "Показы, клики, notices", "HTTPS")
+Rel(bidding, redis, "Атомарный резерв + решение", "Redis protocol")
+Rel(campaign, cpg, "Единственный владелец записи", "SQL")
+Rel(finance, fpg, "Единственный владелец записи", "SQL / ACID")
+Rel(campaign, objects, "Версионированные объекты", "S3 API")
+Rel(bidding, objects, "Snapshot при прогреве", "HTTPS; вне RTB")
+Rel(campaign, kafka, "Campaign changes", "Outbox")
+Rel(finance, kafka, "Grants / settlements", "Outbox")
+Rel(stats, kafka, "Принять и архивировать события", "Producer / consumer")
+Rel(stats, archive, "Объекты + manifests", "S3 API")
+Rel(kafka, bidding, "Проекции и квоты", "Async; вне RTB")
+Rel(kafka, finance, "Проверенные notices", "Consumer")
+Rel(kafka, analytics, "Независимые consumer groups", "Async")
+Rel(analytics, ch, "Собственные read-модели", "Batch insert / SQL")
+Rel(archive, analytics, "Восстановление / backfill", "Replay job")
+
+legend bottom
+  PostgreSQL и Redis разных владельцев не читаются напрямую другими сервисами.
+  Redis runtime — состояние резервов, не кеш бухгалтерского баланса.
+  Statistics владеет приёмом и архивом; Analytics владеет ClickHouse.
+  Региональные контейнеры показаны один раз. Размещение — data-replication.
+  Временный Statistics PostgreSQL трёхмесячного этапа выводится после миграции.
+endlegend
+@enduml
