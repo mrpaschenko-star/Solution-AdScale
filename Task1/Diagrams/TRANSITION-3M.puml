@@ -1,0 +1,76 @@
+@startuml AdScale-TRANSITION-3M
+!pragma layout smetana
+!define RELATIVE_INCLUDE
+!include ./vendor/C4-PlantUML/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+skinparam legendFontColor #333333
+skinparam legendBackgroundColor #FFFFFF
+skinparam legendBorderColor #888888
+title AdScale — C4 Container — промежуточное состояние через три месяца
+
+Person(advertiser, "Рекламодатель", "Управление и отчёты")
+Person_Ext(user, "Пользователь", "Реклама, показы, клики")
+System_Ext(dsp, "DSP-партнёры", "OpenRTB и уведомления")
+System_Ext(payments, "Платёжный шлюз", "Подтверждённые пополнения")
+
+System_Boundary(adscale, "AdScale — один регион, размещение HA по зонам") {
+    Container(ingress, "Ingress / Strangler router", "L7 proxy", "Deadline, canary по DSP/когортам; единственный реальный путь запроса")
+    Container(bidding, "Bidding Service", "C++ / Go", "RTB, кандидаты и аукцион; локальные read-модели; отдельные реплики")
+    ContainerDb(biddingState, "Bidding state", "Redis HA", "Проекции и резервы заранее выделенных квот; владелец Bidding")
+    ContainerDb(snapshots, "Снимки Bidding", "Object storage", "Версионированные проекции для прогрева / восстановления")
+
+    Container(monolith, "Модульный монолит", "C++ / Go / Python / Node.js", "Кабинет, кампании, финансы, Delivery, API отчётов; старый RTB для canary/отката; outbox publisher")
+    ContainerDb(primary, "Transactional primary", "PostgreSQL", "Кампании, финансы, outbox; владелец — монолит")
+    ContainerDb(standby, "HA standby", "PostgreSQL", "Failover; не обслуживает тяжёлые отчёты")
+    ContainerDb(readReplica, "Read replica", "PostgreSQL", "Данные кампаний для отчётов; отдельные лимиты ресурсов")
+
+    Container(events, "Event Ingestion", "Go", "Приём показов, кликов и уведомлений; проверка и durable ACK")
+    ContainerQueue(kafka, "Поток событий и изменений", "Kafka, HA по зонам", "Раздельные topics / группы / квоты; replay")
+    Container(statsWorker, "Statistics Worker", "Python / Go", "Дедупликация, пакетная запись статистики; без запросов в RTB")
+    ContainerDb(statsDb, "Statistics DB", "Отдельный PostgreSQL", "События, партиции и агрегаты; владелец статистики")
+}
+
+Rel(dsp, ingress, "Bid requests / responses", "HTTPS / OpenRTB")
+Rel(ingress, bidding, "Переключённые когорты", "HTTP, sync")
+Rel(ingress, monolith, "Оставшийся трафик / ограниченный откат", "HTTP, sync")
+Rel(bidding, biddingState, "Атомарный резерв и проекции", "Redis protocol")
+Rel(bidding, snapshots, "Снимки вне пути запроса", "S3 API")
+Rel(advertiser, monolith, "Кабинет и управляющие API", "HTTPS")
+Rel(user, monolith, "Получение креатива / разметки", "HTTPS")
+Rel(monolith, payments, "Платёж / проверка статуса", "HTTPS")
+Rel(payments, monolith, "Проверяемый callback", "HTTPS")
+Rel(monolith, primary, "OLTP, outbox; старый RTB ещё читает БД", "SQL")
+Rel(primary, standby, "HA-репликация", "Streaming replication, sync")
+Rel(primary, readReplica, "Репликация для отчётов", "Streaming replication, async")
+Rel(monolith, readReplica, "Ограниченные read-only запросы отчётности", "SQL")
+Rel(monolith, statsWorker, "Запросы агрегированной статистики", "Read API, HTTP")
+Rel(statsWorker, statsDb, "Пакетная запись / чтение агрегатов", "SQL")
+
+Rel(user, events, "Показы / клики", "HTTPS")
+Rel(dsp, events, "Win/loss/billing-уведомления", "HTTPS")
+Rel(events, kafka, "Приём подтверждается после quorum ACK", "Kafka protocol")
+Rel(monolith, kafka, "Outbox: кампании и квоты", "Async")
+Rel(kafka, bidding, "Обновление проекций и квот", "Consumer groups, async")
+Rel(kafka, statsWorker, "Поток статистики", "Consumer group, async")
+Rel(kafka, monolith, "Финансовые события: inbox + ledger", "Consumer group, async")
+
+note right of monolith
+  Логические модули остаются одной единицей развёртывания.
+  Старый RTB и Bidding не расходуют один и тот же лимит независимо.
+  Старый путь также использует безопасное разделение бюджетов.
+end note
+
+note bottom of statsDb
+  Нет прямой записи массовых событий в transactional primary.
+  Выбор PostgreSQL для статистики подтверждается тестом events/s.
+  При недостаточной мощности ClickHouse вводится раньше годового этапа.
+end note
+
+legend bottom
+  Цель: ≥18 000 RPS; текущий поток P95 ≤100 мс; новая DSP — отдельный контракт ≤80 мс.
+  Shadow не совершает ставок и не резервирует реальные деньги.
+  Откат ограничен проверенной мощностью старого пути.
+  Топология зон, backup, CI/CD и наблюдаемость не детализированы в Container view.
+endlegend
+@enduml

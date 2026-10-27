@@ -1,0 +1,115 @@
+@startuml AdScale-TO-BE
+!pragma layout smetana
+!define RELATIVE_INCLUDE
+!include ./vendor/C4-PlantUML/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+skinparam legendFontColor #333333
+skinparam legendBackgroundColor #FFFFFF
+skinparam legendBorderColor #888888
+title AdScale — C4 Container — целевое состояние через год
+
+Person(advertiser, "Рекламодатель", "Кампании, бюджеты, отчёты")
+Person_Ext(user, "Пользователь сайта / приложения", "Просмотр рекламы, клики")
+System_Ext(dsp, "DSP-партнёры", "OpenRTB; win/loss/billing-уведомления")
+System_Ext(payments, "Платёжный шлюз", "Пополнения и подтверждения платежей")
+
+System_Boundary(adscale, "AdScale") {
+    Container(globalRouting, "Global routing", "DNS / global load balancing", "Маршрут в здоровый регион; региональные endpoints")
+
+    Boundary(serving, "Региональный serving-контур — одинаковые контейнеры в регионах A и B") {
+        Container(rtbIngress, "RTB ingress", "L7 proxy / load balancer", "TLS, deadline, admission control, маршрутизация по DSP")
+        Container(bidding, "Bidding Service", "C++ / Go", "RTB-адаптеры, кандидаты, аукцион; локальные read-модели; резерв квоты")
+        ContainerDb(biddingRedis, "Bidding state", "Redis HA", "Проекции и атомарные резервы выделенных региональных квот; владелец Bidding")
+        ContainerDb(bidSnapshots, "Снимки Bidding", "Object storage", "Версионированные производные данные; владелец Bidding")
+        Container(delivery, "Delivery Service", "Node.js / Go", "Выдача HTML/JS; готовые шаблоны вне пути RTB")
+        ContainerDb(deliveryCache, "Delivery cache", "Redis HA", "Производная модель креативов; владелец Delivery")
+        Container(events, "Event Ingestion Service", "Go; API и фоновые workers", "Проверка показов, кликов и уведомлений; устойчивый приём; архивирование")
+        ContainerQueue(kafka, "Региональный журнал событий", "Kafka, репликация по зонам", "Events, billing, campaign changes, grants; отдельные topics и права; at-least-once")
+        ContainerDb(archive, "Архив событий", "Object storage", "Долгий retention и replay; владелец Event Ingestion")
+    }
+
+    Boundary(control, "Управление — один активный владелец записи, DR-копии в другом регионе") {
+        Container(api, "Management API Gateway", "API gateway", "TLS, аутентификация, rate limits; вне RTB-пути")
+        Container(dashboard, "Advertiser Dashboard / BFF", "JavaScript / Node.js", "UI и композиция API; stateless")
+        Container(campaign, "Campaign Service", "Go / Python", "Кампании, ставки, таргетинг, метаданные креативов; outbox publisher")
+        ContainerDb(campaignDb, "Campaign DB", "PostgreSQL HA", "Кампании и outbox; только Campaign имеет доступ")
+        ContainerDb(creatives, "Оригиналы креативов", "Object storage", "Версии файлов; владелец Campaign; опубликованные объекты доступны CDN")
+        Container(finance, "Finance Service", "Go", "Ledger, платежи, квоты, сверка; inbox/outbox")
+        ContainerDb(financeDb, "Finance DB", "PostgreSQL HA", "Проводки, резервы квот, идемпотентность; только Finance имеет доступ")
+    }
+
+    Boundary(reporting, "Аналитический контур — изолирован от serving и OLTP") {
+        Container(analytics, "Analytics Service", "Python / Go", "Consumer, дедупликация, агрегации и API отчётов")
+        ContainerDb(clickhouse, "Analytics DB", "ClickHouse, реплицируемый", "События и агрегаты; владелец Analytics")
+    }
+
+    Container(cdn, "CDN", "Managed CDN", "Выдача опубликованных креативов")
+    Container(observability, "Наблюдаемость", "OpenTelemetry / metrics / logs", "SLO, latency, lag, технические no-bid; не участвует в ответе")
+}
+
+Rel(dsp, globalRouting, "Bid requests; ответы по тому же соединению", "HTTPS / OpenRTB")
+Rel(globalRouting, rtbIngress, "Выбирает здоровый регион", "HTTPS")
+Rel(rtbIngress, bidding, "Запрос с deadline", "HTTP / OpenRTB, sync")
+Rel(bidding, biddingRedis, "Атомарный резерв; обновление проекций", "Redis protocol, региональный")
+Rel(bidding, bidSnapshots, "Публикация / загрузка снимков вне запроса", "S3 API, async")
+
+Rel(user, delivery, "Получает разметку", "HTTPS")
+Rel(user, cdn, "Загружает креатив", "HTTPS")
+Rel(cdn, creatives, "Читает опубликованную версию", "HTTPS, read-only")
+Rel(delivery, deliveryCache, "Читает / обновляет модель выдачи", "Redis protocol")
+Rel(user, events, "Показы / клики", "HTTPS")
+Rel(dsp, events, "Авторитетные win/loss/billing-события", "HTTPS, проверка подлинности")
+Rel(events, kafka, "Публикует; подтверждает приём после quorum ACK", "Kafka protocol")
+Rel(kafka, events, "Поток для архивного worker", "Consumer group")
+Rel(events, archive, "Архивирует события", "S3 API, async")
+
+Rel(advertiser, api, "Кабинет и управляющие операции", "HTTPS")
+Rel(api, dashboard, "Маршрутизация UI / API", "HTTPS")
+Rel(dashboard, campaign, "CRUD кампаний и остановка", "REST, sync")
+Rel(dashboard, finance, "Пополнение, балансы, счета", "REST, sync")
+Rel(dashboard, analytics, "Отчёты с отметкой актуальности", "REST, sync")
+Rel(campaign, campaignDb, "Состояние + outbox одной транзакцией", "SQL")
+Rel(campaign, creatives, "Загружает и публикует версии", "S3 API")
+Rel(finance, financeDb, "Ledger + inbox/outbox одной транзакцией", "SQL")
+Rel(finance, payments, "Создаёт платёж / проверяет статус", "HTTPS / REST")
+Rel(payments, api, "Подписанные уведомления", "HTTPS")
+Rel(api, finance, "Маршрутизирует платёжный callback", "HTTPS")
+
+Rel(campaign, kafka, "Outbox: версии кампаний / креативов", "Async, доставка в регионы")
+Rel(finance, kafka, "Outbox: региональные квоты / итоги расчётов", "Async, доставка в регионы")
+Rel(kafka, bidding, "Обновляет кампании и выданные квоты", "Consumer groups, async")
+Rel(kafka, delivery, "Обновляет проекцию креативов", "Consumer group, async")
+Rel(kafka, finance, "События для идемпотентного расчёта", "Consumer group, async")
+Rel(kafka, analytics, "События и изменения справочников", "Consumer groups, async")
+Rel(analytics, archive, "Читает архив для replay", "S3 API, read-only")
+Rel(analytics, clickhouse, "Запись проекций / запросы отчётов", "Native / HTTP")
+Rel(bidding, observability, "Метрики и выборочные трассы", "Async; аналогично другим сервисам")
+
+note right of bidding
+  Критический путь: ingress → Bidding → региональный резерв → ответ.
+  Нет SQL, межрегионального RPC и синхронного вызова Delivery.
+  При просроченных данных или неопределённой квоте — no-bid.
+  После неопределённого failover Redis старая квота блокируется.
+end note
+
+note bottom of kafka
+  В каждом регионе свой журнал; межрегиональная доставка асинхронная.
+  Домены владеют topics; доступ ограничен правами и ресурсными квотами.
+  Одна стрелка consumer обозначает логический поток: consumer сам читает Kafka.
+end note
+
+note bottom of financeDb
+  Один writer ledger; между регионами нет неограниченного active-active.
+  DR failover требует fencing и сверки сомнительных квот.
+  Межрегиональный RPO=0 этой схемой не гарантируется.
+end note
+
+legend bottom
+  C4 Container: приложение или хранилище, а не отдельный сервер.
+  Стрелки API показывают инициатора; ответы возвращаются по тому же соединению.
+  Async означает обработку вне критического пути RTB.
+  Годовая цель: 50 000 RPS суммарно; SLA 99,9% с согласованной областью измерения.
+  50 000 RPS при потере региона требуют соответствующего резерва в другом.
+endlegend
+@enduml

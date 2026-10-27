@@ -1,0 +1,65 @@
+@startuml component-bidding
+!pragma layout smetana
+!define RELATIVE_INCLUDE
+!include ../../Diagrams/vendor/C4-PlantUML/C4_Component.puml
+LAYOUT_TOP_DOWN()
+skinparam legendFontColor #333333
+skinparam legendBackgroundColor #FFFFFF
+skinparam legendBorderColor #888888
+title AdScale — C4 Component — Bidding Service
+
+System_Ext(dsp, "DSP-партнёр", "Bid requests и отдельные уведомления")
+Container(gateway, "DSP gateway", "Envoy", "mTLS, лимиты, routing, deadline; retries выключены")
+Container(campaign, "Campaign", "gRPC + outbox", "Авторитетные кампании; manifest согласованного снимка")
+Container(finance, "Finance", "gRPC + PostgreSQL + outbox", "Ledger и обеспеченные grants; дедупликация billable-фактов")
+ContainerQueue(kafka, "Региональный журнал", "Kafka", "Изменения кампаний, grants, notices, settlements; отдельные topics")
+ContainerDb(snapshot, "Снимки", "Object storage", "Immutable проекция, SHA-256 и checkpoint")
+ContainerDb(redis, "Bidding state", "Redis HA", "Резервы и решения по шардам; одна generation, без автопродолжения после потери состояния")
+Container(ingestion, "Event Ingestion", "HTTPS + Kafka producer", "Отдельный event ingress; ACK после устойчивой записи")
+
+Container_Boundary(bidding, "Bidding Service — один serving-процесс C++") {
+    Component(adapter, "OpenRTB adapter", "HTTP / JSON", "Профиль площадки, schema, tmax, доверенная identity")
+    Component(orchestrator, "Bid orchestrator", "C++", "Общий deadline, ранний no-bid, порядок этапов")
+    Component(candidates, "Candidate selector", "C++", "Таргетинг, eligibility, разрешённые креативы")
+    Component(auction, "Auction core", "C++", "Существующие правила, расчёт цены, pacing")
+    Component(response, "Response builder", "C++", "Проверенный adm/URL и correlation reference; без Delivery RPC")
+    Component(quota, "Quota client", "Redis function / Lua", "FinalizeDecision: дедупликация, резерв и ответ атомарно")
+    ComponentDb(model, "Read-модель", "Immutable in-memory index", "Кампании, креативы, версии; не отдельная БД/сервис")
+    Component(projection, "Projection / quota manager", "Фоновые задачи C++", "Snapshot + replay, watermark, grants, recovery; отдельные лимиты ресурсов")
+}
+
+Rel(dsp, gateway, "Запрос и ответ аукциона", "HTTPS / OpenRTB")
+Rel(gateway, adapter, "Один upstream-вызов", "HTTP + mTLS; критический путь")
+Rel(adapter, orchestrator, "Нормализованный запрос и остаток времени", "in-process")
+Rel(orchestrator, candidates, "Подбор", "in-process")
+Rel(candidates, model, "Проверка текущей версии", "local read")
+Rel(orchestrator, auction, "Расчёт", "in-process")
+Rel(auction, model, "Правила и параметры", "local read")
+Rel(orchestrator, response, "Подготовить предложение ответа", "in-process")
+Rel(orchestrator, quota, "Подтвердить решение до выдачи ставки", "in-process")
+Rel(quota, redis, "Резерв + RequestDecision в одном slot", "Redis protocol; максимум 6 мс")
+Rel(projection, model, "Атомарная смена версии", "in-process, async")
+Rel(projection, campaign, "GetManifest при прогреве", "gRPC + mTLS, вне RTB")
+Rel(projection, snapshot, "Загрузка и проверка снимка", "HTTPS / S3 API, вне RTB")
+Rel(projection, finance, "AllocateGrant / GetGrantStatus", "gRPC + mTLS, вне RTB")
+Rel(kafka, projection, "Кампании, grants и расчёты", "Consumer groups, async")
+Rel(projection, redis, "Управление разрешённой generation; settlement по версии", "Redis protocol, async")
+Rel(campaign, kafka, "Outbox: campaign changes", "Async")
+Rel(finance, kafka, "Outbox: grants / settlements", "Async")
+Rel(dsp, ingestion, "Win / loss / billable", "HTTPS, отдельно от аукциона")
+Rel(ingestion, kafka, "Устойчивый приём событий", "acks=all")
+Rel(kafka, finance, "Проверенные notices", "Consumer group, async")
+
+note right of quota
+  Без подтверждённого резерва нет bid.
+  Redis timeout: неизвестный результат,
+  no-bid без повторного списания.
+end note
+
+legend bottom
+  Компоненты внутри Bidding не являются отдельными сетевыми сервисами.
+  Campaign, Finance, Kafka и снимки не вызываются на каждый bid request.
+  В пилоте Campaign и Finance могут оставаться модулями монолита с адаптерами.
+  Ответ возвращается по исходному HTTP-соединению; отдельный reverse RPC не нужен.
+endlegend
+@enduml
